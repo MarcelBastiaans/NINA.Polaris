@@ -67,7 +67,9 @@ Each tab in the sidebar has its own page. Read the ones you need:
   + management + smart calibration + algorithm presets + embedded xpra
   GUI (Linux only).
 - **[FOCUS](focus.md)**, manual stepper + V-curve auto-focus with live
-  preview canvas.
+  preview canvas. Its **[Focus Stars](mount-view.md)** page picks a bright
+  star to focus on, on a live 3D model of the mount that follows it as it
+  moves (pier side and meridian flips included).
 - **[PREVIEW](preview.md)**, snap test shots with optional save +
   continuous stream mode.
 - **[AUTORUN](autorun.md)**, simple sequence editor with end-actions.

@@ -44,6 +44,11 @@ const _polarisCharts = {
     guide: null, af: null, hfr: null, temp: null, hist: null, alt: null
 };
 
+// MOUNTVIEW: the Focus Stars page's 3D viewer (js/mount-view.js). Module scope for
+// the same reason as _polarisCharts: it holds a canvas context and observers
+// that must stay out of Alpine's reactive proxies.
+let _mountViewer = null;
+
 // Containers that host a pan/zoomable image canvas. Everything the
 // PANZOOM block does (bind listeners, measure the letterboxed bitmap)
 // starts by walking up from the canvas to one of these. The FOCUS frames
@@ -481,14 +486,18 @@ function ninaApp() {
         // Mount
         mount: {
             ra: null, dec: null, alt: null, az: null,
+            // MOUNTVIEW: the server's hour angle of date (hours), see mountViewPush.
+            hourAngle: null,
             tracking: false, slewing: false, parked: false,
+            parking: false, goingHome: false,
+            park: null,   // MOUNTVIEW: { ha, decDate, ra, dec (J2000) } when the driver's park position is readable
             pierSide: 'unknown', connected: false,
             // Capabilities flags from MountCapabilities.cs, populated
             // each WS tick. Drives per-button visibility (Park, Find
             // Home, pier side indicator) so AltAz / non-GEM mounts
             // don't show buttons that would 501 if clicked.
             capabilities: { park: true, trackingToggle: true, sync: true,
-                            pierSide: true, manualJog: true, findHome: false,
+                            pierSide: true, manualJog: true, findHome: false, goToHome: false,
                             setSiteLocation: false },
             // Site and clock the mount holds (status feed), for the
             // mount-vs-Polaris table on the mount card.
@@ -500,9 +509,17 @@ function ninaApp() {
         // it. _drag is transient state held during a mouse/touch drag.
         mountPanel: { x: 24, y: 80, visible: true },
         // Tabs the floating mount panel appears on. One shared panel
-        // instance; Sky (map-actions bar), Focus,
-        // Preview and Live with a Mount button in their controls.
+        // instance; Sky (map-actions bar), Focus, Preview, Live and
+        // MOUNT (view toolbar) with a Mount button in their controls.
         mountPanelTabs: ['sky', 'focus', 'preview', 'live'],
+        // MOUNTVIEW: which model the Focus Stars page draws, 'gem' (EQ) or
+        // 'altaz'. Chosen by hand: drivers report the pier side too
+        // unreliably to pick for you. Per browser, in localStorage.
+        mountViewModel: 'gem',
+        mountViewGrid: 'none',        // coordinate grid on the Focus Stars sky: 'none' | 'altaz' | 'eq'
+        focusStarSelected: null,      // hip of the focus star last centred on the Focus Stars sky
+        mountViewStarsOpen: false,    // the focus star drop-down over the Focus Stars sky
+        mountViewCentre: null,        // { raHours, decDeg } under the Focus Stars sky's centre mark, the Sync here target
         // Live-camera preview floats next to the mount panel by
         // default. Shares the same draggable + persist pattern.
         // Visibility flag lives in slewPreviewVisible above so the
@@ -5239,6 +5256,12 @@ function ninaApp() {
         // enter + on demand via Refresh. items[] comes from
         // /api/polar/best-targets and is sorted server-side by score.
         polarTargets: { items: [], loading: false, lastFetchUtc: null },
+        // MOUNTVIEW: bright stars to focus on now (/api/focus/stars).
+        focusStars: { items: [], loading: false, fetchedAt: 0, minMag: -1.5, maxMag: 2, minAlt: 20,
+                      useMag: true, useAlt: true,       // each limit has an on/off checkbox
+                      avoidMoon: false, moonDeg: 15,     // leave out stars this close to the Moon while it is up
+                      useSlew: false, maxSlew: 50,       // leave out stars further than this from the mount's pointing
+                      sortBy: null, sortDesc: true },   // sortBy null = ranked, best first
 
         // RDPA-4: workflow picker inside the POLAR tab. 'tppa' shows
         // the original 3-point sweep; 'rudimentary' shows the
@@ -8933,7 +8956,8 @@ function ninaApp() {
         _navItems() {
             return [
                 { id: 'home', label: 'Home' }, { id: 'equip', label: 'Rigs' },
-                { id: 'polar', label: 'Polar' }, { id: 'sky', label: 'Sky' },
+                { id: 'polar', label: 'Polar' },
+                { id: 'sky', label: 'Sky' },
                 { id: 'focus', label: 'Focus' }, { id: 'guide', label: 'Guide' },
                 { id: 'preview', label: 'Preview' }, { id: 'sequence', label: 'Autorun' },
                 { id: 'plan', label: 'Plan' }, { id: 'live', label: 'Live' },
@@ -33955,6 +33979,12 @@ function ninaApp() {
                 if (typeof saved.visible === 'boolean') this.mountPanel.visible = saved.visible;
                 this._clampMountPanel();
             } catch { /* corrupt storage, ignore */ }
+            try {
+                const m = localStorage.getItem('mountViewModel');
+                if (m === 'gem' || m === 'altaz') this.mountViewModel = m;   // an old 'auto' stays EQ
+                const g = localStorage.getItem('mountViewGrid');
+                if (g === 'none' || g === 'altaz' || g === 'eq') this.mountViewGrid = g;
+            } catch { /* storage disabled, keep 'auto' */ }
         },
 
         // Show/hide the floating mount panel. Shift+click resets it
@@ -33978,6 +34008,199 @@ function ninaApp() {
                     visible: this.mountPanel.visible
                 }));
             } catch { /* storage full / disabled, non-fatal */ }
+        },
+
+        // --- MOUNTVIEW: the Focus Stars page's live 3D model ---
+
+        // The viewer is built the first time the tab opens, not at init:
+        // a hidden canvas has no size to build it at.
+        // MOUNTVIEW: the 3D mount and sky view is the FOCUS tab's Focus
+        // Stars page; it draws and refreshes only while that is on screen.
+        _mountViewVisible() {
+            return this.tab === 'focus' && this.focusTab === 'stars';
+        },
+        // Entering the Focus Stars page, from the FOCUS tab or its sub-page strip.
+        focusStarsPageEnter() {
+            this.mountViewOnTabEnter();
+            this.focusStarsOnTabEnter();
+        },
+        mountViewOnTabEnter() {
+            this.$nextTick(() => {
+                const canvas = this.$refs.mountViewCanvas;
+                if (!canvas || !window.PolarisMountView) return;
+                if (!_mountViewer) {
+                    _mountViewer = window.PolarisMountView.create(canvas);
+                    // A tap on a ringed star on the sky selects it in the list.
+                    // A tap on a ringed star selects it; on the selected one, clears it (as Clear does).
+                    _mountViewer.onPick(hip => this.focusStarSelect(hip === this.focusStarSelected ? null : hip));
+                    _mountViewer.onView(c => { this.mountViewCentre = c; });
+                }
+                else _mountViewer.redraw();
+                this.mountViewPush();
+                this.mountViewApplySky();
+            });
+        },
+        // The sky behind the model, always shown (it is what the tab is
+        // for): the grid, then the backdrop stars (fetched once
+        // per page), the custom horizon, the focus stars and the Moon.
+        async mountViewApplySky() {
+            if (!_mountViewer) return;
+            _mountViewer.setGrid(this.mountViewGrid);
+            _mountViewer.setHomeLabel(this._t('Home'));
+            _mountViewer.setParkLabel(this._t('Park'));
+            this.mountViewLoadMoon();
+            // The Moon crosses its own width in about an hour against the
+            // stars; every two minutes is plenty while the tab is open.
+            if (!this._mountMoonTimer) {
+                this._mountMoonTimer = setInterval(() => {
+                    if (this._mountViewVisible()) this.mountViewLoadMoon();
+                }, 120000);
+            }
+            _mountViewer.setFocusStars(this.focusStars.items, this.focusStarSelected);
+            if (!this._mountHorizonLoaded) {
+                this._mountHorizonLoaded = true;
+                await this.horizonLoad();   // pushes to the viewer via _pushHorizonToSky
+            } else {
+                _mountViewer.setHorizon(this.horizonPoints);
+            }
+            if (!this._mountSkyData) {
+                try {
+                    this._mountSkyData = await this.apiGet('/api/sky/backdrop?maxMag=6');
+                } catch (e) {
+                    this._mountSkyData = null;
+                    this.toastFail('Could not load the sky', e, 'warn');
+                    return;
+                }
+            }
+            _mountViewer?.setSky(this._mountSkyData);
+        },
+        // Focus Stars sky coordinate grid, cycled like the SKY tab's:
+        // off -> alt-az -> equatorial -> off. Kept in the browser.
+        cycleMountViewGrid() {
+            const order = ['none', 'altaz', 'eq'];
+            this.mountViewGrid = order[(order.indexOf(this.mountViewGrid) + 1) % order.length];
+            try { localStorage.setItem('mountViewGrid', this.mountViewGrid); } catch { /* non-fatal */ }
+            _mountViewer?.setGrid(this.mountViewGrid);
+        },
+        // Where the Moon is now, for the Focus Stars sky. A failure just leaves
+        // the last position (or none) drawn.
+        async mountViewLoadMoon() {
+            try { this._mountMoon = await this.apiGet('/api/focus/moon'); }
+            catch { return; }
+            this.mountViewPushMoon();
+        },
+        mountViewPushMoon() {
+            const f = this.focusStars;
+            _mountViewer?.setMoon(this._mountMoon || null, f.avoidMoon ? f.moonDeg : 0, this._t('Moon'));
+        },
+        mountViewGridLabel() {
+            return this.mountViewGrid === 'altaz' ? 'Grid: Alt-Az'
+                 : this.mountViewGrid === 'eq' ? 'Grid: Equatorial'
+                 : 'Grid: off';
+        },
+        // Centre button in the focus star list: turn the Focus Stars sky to the
+        // star (switching the sky on if it was off) and mark it.
+        // Select a focus star (a list row, or a ring tapped on the sky); the
+        // action bar's Center and Slew act on it.
+        focusStarSelect(hip) {
+            this.focusStarSelected = hip;
+            _mountViewer?.setFocusStars(this.focusStars.items, hip);
+        },
+        focusStarSelectedItem() {
+            const hip = this.focusStarSelected;
+            return hip == null ? null : (this.focusStars.items.find(x => x.hip === hip) || null);
+        },
+        // A star chosen in the focus star drop-down: select it, turn the
+        // sky view to it and close the list, so the sky is in full view.
+        focusStarChoose(s) {
+            this.mountViewCenterOn(s);
+            this.mountViewStarsOpen = false;
+        },
+        mountViewCenterOn(s) {
+            if (!s) return;
+            this.focusStarSelected = s.hip;
+            _mountViewer?.setFocusStars(this.focusStars.items, s.hip);
+            _mountViewer?.lookAtRaDec(s.raHours, s.decDeg);
+        },
+        mountViewKind() {
+            return this.mountViewModel === 'altaz' ? 'altaz' : 'gem';
+        },
+        // Hand the viewer the latest pose. Called from every status tick
+        // and on a disconnect; a no-op off the tab, and the next tab enter
+        // pushes the current pose anyway.
+        mountViewPush() {
+            if (!_mountViewer || !this._mountViewVisible()) return;
+            // Hour angle poses a GEM's RA axis even on the pole, where alt/az
+            // hardly change. The server's is from the driver's own RA of date;
+            // the ra here is J2000, which on the pole has lost the RA axis, so
+            // LST minus it (precessed to date first) is only a fallback for a
+            // server that sends none. ra and dec go to the viewer as J2000;
+            // it precesses them to the date of the hour angle.
+            let ha = Number.isFinite(this.mount.hourAngle) ? this.mount.hourAngle : null;
+            const ra = this.mount.ra != null ? Number(this.mount.ra) : NaN;
+            const dec = this.mount.dec != null ? Number(this.mount.dec) : NaN;
+            if (ha == null && Number.isFinite(ra) && Number.isFinite(dec)) {
+                const lst = this._localSiderealTime(new Date(), Number(this.settings?.longitude) || 0);
+                const raOfDate = window.PolarisMountView.math.precession(Date.now()).toDate(ra, dec).ra;
+                ha = ((((lst - raOfDate) % 24) + 36) % 24) - 12;
+            }
+            _mountViewer.update({
+                kind: this.mountViewKind(),
+                latitude: Number(this.settings?.latitude),
+                ha, ra: Number.isFinite(ra) ? ra : null, dec: this.mount.dec,
+                alt: this.mount.alt, az: this.mount.az,
+                pierSide: this.mount.pierSide,
+                connected: !!this.mount.connected,
+                longitude: Number(this.settings?.longitude),
+                park: this.mount.park ? { ha: this.mount.park.ha, dec: this.mount.park.decDate } : null
+            });
+        },
+        // The mount's home on the Focus Stars sky, as J2000 for the positions
+        // table: the celestial pole above the horizon (the pole of date,
+        // which precession has moved off J2000's). Null for an alt-az mount,
+        // whose home is not the pole.
+        mountViewHomeRaDec() {
+            if (this.mountViewModel === 'altaz') return null;
+            const lat = Number(this.settings?.latitude);
+            const P = window.PolarisMountView?.math?.precession;
+            if (!Number.isFinite(lat) || !P) return null;
+            const j = P(Date.now()).toJ2000(0, lat >= 0 ? 90 : -90);
+            return { raHours: j.ra, decDeg: j.dec };
+        },
+        mountViewSetModel(model) {
+            this.mountViewModel = model === 'altaz' ? 'altaz' : 'gem';
+            try { localStorage.setItem('mountViewModel', this.mountViewModel); } catch { /* non-fatal */ }
+            this.mountViewPush();
+        },
+        // Model button, toggled like Grid and View: EQ <-> Alt-AZ.
+        cycleMountViewModel() {
+            this.mountViewSetModel(this.mountViewModel === 'gem' ? 'altaz' : 'gem');
+        },
+        mountViewModelLabel() {
+            return this.mountViewModel === 'altaz' ? this._t('Mount: Alt-AZ') : this._t('Mount: EQ');
+        },
+        // Sync here on MOUNT: the red mark in the middle of the sky view,
+        // read fresh from the viewer rather than the last readout.
+        mountViewSyncCentre() {
+            const c = _mountViewer?.viewCentre();
+            if (!c) { this.toast('Sky view not ready', 'error'); return; }
+            // The view tilts below the horizon; no mount can point there, so a
+            // sync to it would only wreck the pointing model.
+            const alt = this._targetAltitudeDeg(c.raHours, c.decDeg);
+            if (alt !== null && alt < 0) {
+                this.toast('The red mark is below the horizon. Tilt the view up to the sky to sync.', 'error');
+                return;
+            }
+            this.syncMountHere({ ra: c.raHours, dec: c.decDeg, name: this._t('The centre of the sky view') });
+        },
+        // Slew Center: GoTo the red mark in the middle of the Focus Stars sky.
+        // Refused below the horizon, like every GoTo from the sky.
+        async mountViewSlewCentre() {
+            const c = _mountViewer?.viewCentre();
+            if (!c) { this.toast('Sky view not ready', 'error'); return; }
+            if (!this.mount?.connected) { this.toast('Mount not connected', 'warn'); return; }
+            if (this._blockIfBelowHorizon(c.raHours, c.decDeg)) return;
+            await this.slewTo(c.raHours, c.decDeg);
         },
 
         // Persist the user's show/hide preference for the camera
@@ -35790,7 +36013,9 @@ function ninaApp() {
         // so land there; otherwise the manual assist is the only
         // useful thing. The user can flip freely either way.
         manualFocusOnTabEnter() {
-            if (this.focusConnected && this.focusTab === 'assist'
+            if (this.focusTab === 'stars') {
+                this.focusStarsPageEnter();
+            } else if (this.focusConnected && this.focusTab === 'assist'
                 && this.manualFocus.samples.length === 0) {
                 this.focusTab = 'vcurve';
             } else if (!this.focusConnected) {
@@ -35817,6 +36042,8 @@ function ninaApp() {
                 });
             } else if (this.focusTab === 'vcurve') {
                 this.$nextTick(() => this._replayCachedFrame('focusCanvas'));
+            } else if (this.focusTab === 'stars' && this.tab === 'focus') {
+                this.focusStarsPageEnter();
             }
         },
 
@@ -36388,6 +36615,111 @@ function ninaApp() {
                 await this.apiPost('/api/autofocus/abort');
                 this.toast('Auto-focus abort requested', 'warn');
             } catch (e) { this.toast('AF abort failed', 'error'); }
+        },
+
+        // ---- MOUNTVIEW: focus stars ----
+
+        // Refetch on entering Focus Stars when the list is over 5 minutes old: the
+        // ranking moves with the sky and with where the mount points.
+        focusStarsOnTabEnter() {
+            try {
+                const lim = JSON.parse(localStorage.getItem('focusStarsLimits') || 'null');
+                // A saved single limit (before the range) set the faint end
+                // only: start the range afresh rather than squeeze it to one value.
+                // Ranges saved before the -1.5 to 2 default (magRev 2) start
+                // afresh too, so the new default reaches every browser once.
+                if (lim && lim.magRev === 2 && Number.isFinite(lim.minMag) && Number.isFinite(lim.maxMag)) {
+                    this.focusStars.minMag = lim.minMag;
+                    this.focusStars.maxMag = lim.maxMag;
+                }
+                if (lim && Number.isFinite(lim.minAlt)) this.focusStars.minAlt = lim.minAlt;
+                if (lim && typeof lim.useMag === 'boolean') this.focusStars.useMag = lim.useMag;
+                if (lim && typeof lim.useAlt === 'boolean') this.focusStars.useAlt = lim.useAlt;
+                if (lim && typeof lim.avoidMoon === 'boolean') this.focusStars.avoidMoon = lim.avoidMoon;
+                if (lim && Number.isFinite(lim.moonDeg)) this.focusStars.moonDeg = lim.moonDeg;
+                if (lim && typeof lim.useSlew === 'boolean') this.focusStars.useSlew = lim.useSlew;
+                if (lim && Number.isFinite(lim.maxSlew)) this.focusStars.maxSlew = lim.maxSlew;
+            } catch { /* storage blocked or corrupt */ }
+            if (this.focusStars.loading) return;
+            if (Date.now() - this.focusStars.fetchedAt > 5 * 60 * 1000) this.loadFocusStars();
+        },
+        // Magnitude range (min and max boxes, minMag/maxMag, -1.5..6.5,
+        // they never cross), minimum altitude (0..85°), the
+        // Moon distance (1..90°) or the maximum slew (1..180°), or one of
+        // their on/off checkboxes (useMag, useAlt, avoidMoon, useSlew). The
+        // refetch waits for a pause, so quick edits make one request.
+        focusStarsSetLimit(which, raw) {
+            const f = this.focusStars;
+            if (which === 'useMag' || which === 'useAlt' || which === 'avoidMoon' || which === 'useSlew') f[which] = !!raw;
+            else {
+                const v = Number(raw);
+                if (!Number.isFinite(v)) return;
+                const mag = Math.min(6.5, Math.max(-1.5, Math.round(v * 10) / 10));
+                f[which] = which === 'minMag' ? Math.min(mag, f.maxMag)
+                         : which === 'maxMag' ? Math.max(mag, f.minMag)
+                         : which === 'moonDeg' ? Math.min(90, Math.max(1, Math.round(v)))
+                         : which === 'maxSlew' ? Math.min(180, Math.max(1, Math.round(v)))
+                         : Math.min(85, Math.max(0, Math.round(v)));
+            }
+            try {
+                localStorage.setItem('focusStarsLimits', JSON.stringify(
+                    { magRev: 2, minMag: f.minMag, maxMag: f.maxMag, minAlt: f.minAlt, useMag: f.useMag, useAlt: f.useAlt,
+                      avoidMoon: f.avoidMoon, moonDeg: f.moonDeg, useSlew: f.useSlew, maxSlew: f.maxSlew }));
+            } catch { /* storage blocked */ }
+            if (which === 'avoidMoon' || which === 'moonDeg') this.mountViewPushMoon();
+            clearTimeout(this._focusStarsTimer);
+            this._focusStarsTimer = setTimeout(() => this.loadFocusStars(), 300);
+        },
+        async loadFocusStars() {
+            this.focusStars.loading = true;
+            try {
+                // Every limit's value goes up; apply lists the ticked ones,
+                // which cut. The unticked still rank, at half weight.
+                const f = this.focusStars;
+                const apply = [f.useMag && 'mag', f.useAlt && 'alt', f.avoidMoon && 'moon', f.useSlew && 'slew']
+                    .filter(Boolean).join(',');
+                const q = 'limit=12&minMag=' + encodeURIComponent(f.minMag)
+                        + '&maxMag=' + encodeURIComponent(f.maxMag)
+                        + '&minAlt=' + encodeURIComponent(f.minAlt)
+                        + '&moonDeg=' + encodeURIComponent(f.moonDeg)
+                        + '&maxSlew=' + encodeURIComponent(f.maxSlew)
+                        + '&apply=' + encodeURIComponent(apply);
+                const r = await this.apiGet('/api/focus/stars?' + q);
+                this.focusStars.items = Array.isArray(r) ? r : [];
+                this.focusStars.fetchedAt = Date.now();
+                _mountViewer?.setFocusStars(this.focusStars.items, this.focusStarSelected);
+            } catch (e) {
+                this.focusStars.items = [];
+                this.toastFail('Could not load focus stars', e, 'warn');
+            } finally {
+                this.focusStars.loading = false;
+            }
+        },
+        // Mag / Alt header click: largest to smallest first, then smallest
+        // to largest, then back to the ranked order.
+        focusStarsSort(field) {
+            const f = this.focusStars;
+            if (f.sortBy !== field) { f.sortBy = field; f.sortDesc = true; }
+            else if (f.sortDesc) f.sortDesc = false;
+            else f.sortBy = null;
+        },
+        focusStarsSorted() {
+            const f = this.focusStars;
+            if (!f.sortBy) return f.items;
+            const k = f.sortBy, sign = f.sortDesc ? -1 : 1;
+            return [...f.items].sort((a, b) => sign * (a[k] - b[k]));
+        },
+        focusStarsSortMark(field) {
+            const f = this.focusStars;
+            return f.sortBy === field ? (f.sortDesc ? ' ▼' : ' ▲') : '';
+        },
+        // A plain GoTo, no centring: the star lands in the field to within
+        // the pointing model, then Solve & Sync corrects the model if needed.
+        async focusStarSlew(s) {
+            if (!s) return;
+            if (!this.mount?.connected) { this.toast('Mount not connected', 'warn'); return; }
+            if (this._blockIfBelowHorizon(s.raHours, s.decDeg)) return;
+            await this.slewTo(s.raHours, s.decDeg);
         },
 
         // ---- PA-4: Polar alignment (TPPA) actions ----
@@ -37149,6 +37481,7 @@ function ninaApp() {
                 this.toastFail('Find Home failed', e);
             }
         },
+
 
         // Aim the OTA nearly straight up so a flat panel rests on the aperture
         // without sliding off. The server computes the near-zenith RA/Dec (there
@@ -44882,6 +45215,7 @@ function ninaApp() {
                 this.mount.tracking = false;
                 this.mount.slewing = false;
                 this.mount.parked = false;
+                this.mountViewPush();
                 this.toast('Mount disconnected', 'warn');
             } catch (e) {
                 this.toastFail('Mount disconnect failed', e);
@@ -47059,6 +47393,7 @@ function ninaApp() {
         // Push the horizon polygon to the Sky-map iframe (drawn there in the
         // engine's horizontal frame). No-op until the bridge is ready.
         _pushHorizonToSky() {
+            try { _mountViewer?.setHorizon(this.horizonPoints); } catch (e) { /* MOUNT not built */ }
             try {
                 if (this._skySendMessage) this._skySendMessage({ type: 'set-horizon',
                     points: this.horizonPoints.map(p => ({ azimuth: p.azimuth, altitude: p.altitude })) });
@@ -47299,17 +47634,61 @@ function ninaApp() {
             return false;
         },
 
+        // MOUNTVIEW: Home, back to the position the mount was in at power on
+        // (counterweight down, OTA on the pole). A mount with no home position
+        // goes to its park position and is unparked. The request returns at
+        // once; the status socket reports the move (mount.goingHome) and its
+        // result (goHome.run / error / method).
+        async mountGoToHome() {
+            const ok = await this._confirmAsync(
+                'The mount will slew at full speed back to where it was when it was turned on: ' +
+                'counterweight down, pointing at the pole. A mount with no home position goes to ' +
+                'its park position instead and is left unparked. Tracking stops. ' +
+                'Make sure the slew path is clear of obstructions.',
+                {
+                    title: 'Send the mount home?',
+                    okLabel: 'Home',
+                    cancelLabel: 'Cancel',
+                    danger: true   // full-speed slew
+                });
+            if (!ok) return;
+            try {
+                await this.apiPost('/api/telescope/goto-home');
+                this.mount.goingHome = true;
+                this._mountGoHomeAwaiting = true;
+                this.toast('Mount going home', 'info');
+            } catch (e) {
+                this.toastFail('Go-To Home failed', e);
+            }
+        },
+        // The finished-run counter moves on when a Go-To Home ends; tell the
+        // user how it went, once, if this page started it.
+        _mountGoHomeResult(r) {
+            if (!r || typeof r.run !== 'number') return;
+            const seen = this._mountGoHomeRun;
+            this._mountGoHomeRun = r.run;
+            if (seen === undefined || r.run === seen || !this._mountGoHomeAwaiting) return;
+            this._mountGoHomeAwaiting = false;
+            if (r.error) this.toastFail('Go-To Home failed', new Error(r.error));
+            else if (r.method === 'park') this.toast('No home position: mount is at its park position, not parked', 'success');
+            else this.toast('Mount is home', 'success');
+        },
         // Manual position sync: tell the mount it is currently pointing at the
         // map-centre (red FOV) coordinates, WITHOUT moving it. Recovers the
         // driver's pointing model when it lost the real position (e.g. an INDI
         // driver reload reset the AM3 to home) and you can't plate-solve
         // (clouds), you aim the map at the patch the scope is really on and
         // confirm. A wrong sync throws off later GoTos, hence the modal.
-        async syncMountHere() {
+        // given: { ra (hours), dec, name } to sync to instead of the SKY map
+        // centre. The Focus Stars page passes the centre of its own sky view: the
+        // SKY map is not on screen there, so its centre would be a blind sync.
+        async syncMountHere(given) {
             if (!this.mount.connected) { this.toast('Connect a mount first', 'error'); return; }
-            let target = await this._resolveSkyTarget();
+            let target = given && Number.isFinite(given.ra) && Number.isFinite(given.dec)
+                ? { ra: given.ra, dec: given.dec } : await this._resolveSkyTarget();
             if (!target) { this.toast('Sky map not ready', 'error'); return; }
-            const name = (this.skyTarget && this.skyTarget.name) ? this.skyTarget.name + '\n  ' : '';
+            const label = given ? given.name : this.skyTarget?.name;
+            const name = label ? label + '\n  ' : '';
             if (!await this._confirmAsync(
                 'Tell the mount it is pointing at:\n\n  ' + name +
                 'RA ' + this.formatRA(target.ra) + '   Dec ' + this.formatDec(target.dec) +
@@ -47320,7 +47699,8 @@ function ninaApp() {
                 { title: 'Sync mount to this position', okLabel: 'Sync here', danger: true })) return;
             try {
                 await this.apiPost('/api/telescope/sync', { ra: target.ra, dec: target.dec });
-                this.toast('Mount synced to map centre (no movement)', 'ok');
+                this.toast(given ? 'Mount synced to the view centre (no movement)'
+                                 : 'Mount synced to map centre (no movement)', 'ok');
             } catch (e) {
                 this.toastFail('Mount sync failed', e);
             }
@@ -52303,6 +52683,9 @@ function ninaApp() {
                     alt: eq.telescope.alt, az: eq.telescope.az,
                     tracking: eq.telescope.tracking, slewing: eq.telescope.slewing,
                     parked: eq.telescope.parked, pierSide: eq.telescope.pierSide,
+                    hourAngle: eq.telescope.hourAngle ?? null,
+                    parking: !!eq.telescope.parking, goingHome: !!eq.telescope.goingHome,
+                    park: eq.telescope.park ?? null,
                     connected: eq.telescope.connected,
                     // MOUNT: capabilities sub-object gates per-button UI
                     // (Park, Find Home, pier side). Fall back to current
@@ -52321,6 +52704,8 @@ function ninaApp() {
                     // mount-vs-Polaris table on the mount card.
                     site: eq.telescope.site || null
                 });
+                this.mountViewPush();
+                this._mountGoHomeResult(eq.telescope.goHome);
                 // Same "disconnect-doesn't-stick" guard as the camera
                 // above, the EquipmentManager keeps Telescope!=null
                 // after Disconnect, so the WS keeps echoing the name.

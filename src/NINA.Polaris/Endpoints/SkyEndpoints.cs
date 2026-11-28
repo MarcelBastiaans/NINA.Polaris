@@ -21,6 +21,15 @@ public static class SkyEndpoints {
     public static void MapSkyEndpoints(this WebApplication app) {
         var group = app.MapGroup("/api/sky");
 
+        // MOUNTVIEW: the sky drawn behind the Focus Stars page's 3D model. Stars to
+        // maxMag (default 6, at most 7) from the SKY map's own Hipparcos tiles,
+        // plus the western constellation lines by HIP number. Static per run,
+        // so the browser caches it for the session.
+        group.MapGet("/backdrop", (NINA.Polaris.Services.Focus.FocusStarService svc, double? maxMag, HttpContext ctx) => {
+            ctx.Response.Headers.CacheControl = "private, max-age=3600";
+            return Results.Ok(svc.Backdrop(Math.Clamp(maxMag ?? 6, 0, 7)));
+        });
+
         group.MapPost("/slew-and-center", async (SlewAndCenterRequest request,
             SlewCenterService slewCenter, MountSafetyGuardService guard,
             EquipmentManager equip, ProfileService profiles) => {

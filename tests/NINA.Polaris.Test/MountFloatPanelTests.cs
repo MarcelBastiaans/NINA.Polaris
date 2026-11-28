@@ -21,11 +21,16 @@ namespace NINA.Polaris.Test;
 
 /// <summary>The floating Mount control is one panel shared by SKY, FOCUS,
 /// PREVIEW and LIVE. It used to live inside the SKY tab, so it vanished on
-/// every other tab; each of the four now has a Mount button that toggles
-/// the same panel through toggleMountPanel().</summary>
+/// every other tab; each of them now has a Mount button that toggles the
+/// same panel through toggleMountPanel(). FOCUS has two, one on each
+/// sub-page that shows the panel (Manual Assist and Focus Stars).</summary>
 [TestFixture]
 public class MountFloatPanelTests {
     private static readonly string[] Tabs = { "sky", "focus", "preview", "live" };
+    /// <summary>Mount buttons per tab: FOCUS has one on Manual Assist and
+    /// one on Focus Stars, each shown only on its own sub-page.</summary>
+    private static int ButtonsOn(string tab) => tab == "focus" ? 2 : 1;
+    private static int AllButtons => Tabs.Sum(ButtonsOn);
     private const string Toggle = "@click=\"toggleMountPanel($event)\"";
 
     private static string Here([CallerFilePath] string p = "") => p;
@@ -97,9 +102,9 @@ public class MountFloatPanelTests {
         });
     }
 
-    /// <summary>What: each of the four tabs has exactly one button that
-    /// calls <c>toggleMountPanel($event)</c>, and no other part of the page
-    /// has one.
+    /// <summary>What: each of the four tabs has its Mount buttons that call
+    /// <c>toggleMountPanel($event)</c> (one, or one per FOCUS sub-page), and
+    /// no other part of the page has one.
     /// Why: the panel can only be opened from a tab that has a button. A
     /// button lost in a markup edit leaves the panel unreachable on that
     /// tab, and a duplicate or stray one on a tab that never shows the
@@ -110,9 +115,9 @@ public class MountFloatPanelTests {
         Assert.Multiple(() => {
             foreach (var tab in Tabs) {
                 var (s, e) = Tab(html, tab);
-                Assert.That(Regex.Matches(html[s..e], Regex.Escape(Toggle)).Count, Is.EqualTo(1), tab);
+                Assert.That(Regex.Matches(html[s..e], Regex.Escape(Toggle)).Count, Is.EqualTo(ButtonsOn(tab)), tab);
             }
-            Assert.That(Regex.Matches(html, Regex.Escape(Toggle)).Count, Is.EqualTo(Tabs.Length),
+            Assert.That(Regex.Matches(html, Regex.Escape(Toggle)).Count, Is.EqualTo(AllButtons),
                 "no Mount button outside the four tabs");
         });
     }
@@ -137,7 +142,7 @@ public class MountFloatPanelTests {
             Assert.That(body, Does.Contain("this.persistMountPanel()"));
             Assert.That(Regex.Matches(html,
                 Regex.Escape(Toggle) + @"\s*@contextmenu\.prevent=""resetMountPanelPosition\(\); mountPanel\.visible = true""").Count,
-                Is.EqualTo(Tabs.Length));
+                Is.EqualTo(AllButtons));
         });
     }
 
@@ -156,7 +161,7 @@ public class MountFloatPanelTests {
         const string key = "Connect a mount in RIGS first";
         var html = Uncommented(Html());
         var buttons = Regex.Matches(html, Regex.Escape(Toggle));
-        Assert.That(buttons.Count, Is.EqualTo(Tabs.Length));
+        Assert.That(buttons.Count, Is.EqualTo(AllButtons));
         var dir = Path.Combine(Wwwroot(), "data", "locales");
         Assert.Multiple(() => {
             foreach (Match b in buttons) {

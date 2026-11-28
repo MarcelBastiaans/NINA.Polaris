@@ -26,6 +26,30 @@ public static class FocusEndpoints {
     public static void MapFocusEndpoints(this IEndpointRouteBuilder app) {
         var group = app.MapGroup("/api/focus");
 
+        // GET /api/focus/stars?limit=12&minMag=2&maxMag=4&minAlt=20&moonDeg=15&maxSlew=50&apply=mag,alt
+        // The bright stars best placed to focus on right now (Focus Stars page),
+        // ranked by brightness, altitude, a short slew from where the mount
+        // points, distance from the Moon and no meridian crossing mid-focus.
+        // The four limits listed in apply (mag, alt, moon, slew) are
+        // cut-offs; the others cut nothing and rank at half weight. Without
+        // apply, mag and alt are applied. Stars always clear the custom
+        // horizon for the next 20 minutes. Pure compute against the bundled
+        // Hipparcos tiles, no state.
+        group.MapGet("/stars", (FocusStarService svc, int? limit, double? minMag, double? maxMag, double? minAlt,
+                                double? moonDeg, double? maxSlew, string? apply) =>
+            Results.Ok(svc.Suggest(limit.GetValueOrDefault(12),
+                maxMagnitude: maxMag ?? FocusStarService.DefaultMaxMagnitude,
+                minAltitudeDeg: minAlt ?? FocusStarService.DefaultMinAltitude,
+                moonDeg: moonDeg ?? FocusStarService.DefaultMoonDeg,
+                maxSlewDeg: maxSlew ?? FocusStarService.DefaultMaxSlew,
+                applied: ParseLimits(apply),
+                minMagnitude: minMag ?? FocusStarService.DefaultMinMagnitude)));
+
+        // GET /api/focus/moon
+        // Where the Moon is now for the active site, for the Focus Stars sky to
+        // draw it to scale with its phase.
+        group.MapGet("/moon", (FocusStarService svc) => Results.Ok(svc.Moon()));
+
         // POST /api/focus/bahtinov [{ starX, starY, roiHalf }]
         //
         // Analyses the last frame ImageRelayService cached, whoever put it
@@ -105,4 +129,19 @@ public static class FocusEndpoints {
     }
 
     public record BahtinovRequest(int? StarX, int? StarY, int? RoiHalf);
+
+    /// <summary>"mag,alt,moon,slew" (any subset, any order) to the limits
+    /// applied as cut-offs; null gives the default (mag and alt), an empty
+    /// string none.</summary>
+    internal static FocusLimit ParseLimits(string? apply) {
+        if (apply == null) return FocusStarService.DefaultApplied;
+        var l = FocusLimit.None;
+        foreach (var t in apply.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) {
+            l |= t.ToLowerInvariant() switch {
+                "mag" => FocusLimit.Magnitude, "alt" => FocusLimit.Altitude,
+                "moon" => FocusLimit.Moon, "slew" => FocusLimit.Slew, _ => FocusLimit.None
+            };
+        }
+        return l;
+    }
 }

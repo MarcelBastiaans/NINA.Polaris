@@ -56,6 +56,7 @@ public class IndiTelescope : ITelescope {
         SupportsManualJog:       _client.GetProperty(DeviceName, "TELESCOPE_MOTION_NS") != null
                                  && _client.GetProperty(DeviceName, "TELESCOPE_MOTION_WE") != null,
         SupportsFindHome:        _client.GetProperty(DeviceName, "TELESCOPE_HOME") != null,
+        SupportsGoToHome:        _client.GetProperty(DeviceName, "TELESCOPE_HOME") != null || CanParkAtDefault,
         SupportsSetSiteLocation: _client.GetProperty(DeviceName, "GEOGRAPHIC_COORD") != null,
         SupportsSetSiteTime:     _client.GetProperty(DeviceName, "TIME_UTC") != null,
         SupportsTrackingModes:   _client.GetProperty(DeviceName, "TELESCOPE_TRACK_MODE") != null,
@@ -78,10 +79,85 @@ public class IndiTelescope : ITelescope {
         if (ra == 0 && dec == 0) return (0, 0);
         return NINA.Core.Utility.EquatorialEpoch.JNowToJ2000(ra, dec, DateTime.UtcNow);
     }
+    // The driver's own RA of date against its own LST: unlike LST minus the
+    // J2000 RA above, it keeps following the RA axis with the scope on the
+    // pole, and it uses the clock the driver positioned the axis with.
+    // Drivers without TIME_LST (it is EQMod's, not standard) get null and
+    // the caller's site-LST fallback.
+    public double? HourAngle {
+        get {
+            double ra = _client.GetNumber(DeviceName, "EQUATORIAL_EOD_COORD", "RA");
+            double dec = _client.GetNumber(DeviceName, "EQUATORIAL_EOD_COORD", "DEC");
+            double lst = _client.GetNumber(DeviceName, "TIME_LST", "LST");
+            if (!double.IsFinite(ra) || !double.IsFinite(lst) || (ra == 0 && dec == 0)) return null;
+            return ((((lst - ra) % 24) + 36) % 24) - 12;
+        }
+    }
+    /// <summary>The park position from TELESCOPE_PARK_POSITION, only where
+    /// its units are certain, so the Focus Stars sky never marks a wrong place:
+    /// PARK_AZ / PARK_ALT in degrees (refused outside 0..360 and -90..90,
+    /// which is a driver keeping encoder steps under the same names), or
+    /// PARK_RA / PARK_DEC as EQMod's motor encoder steps, for the EQMod
+    /// driver itself (DRIVER_INFO.DRIVER_EXEC), not a look-alike. Other
+    /// drivers' PARK_RA may be an RA or an hour angle: null, not a guess.</summary>
+    public (double HaHours, double DecDeg)? ParkHaDec {
+        get {
+            if (_client.GetProperty(DeviceName, "TELESCOPE_PARK_POSITION") is not IndiNumberProperty park) return null;
+            if (park.Values.TryGetValue("PARK_AZ", out var az) && park.Values.TryGetValue("PARK_ALT", out var alt)) {
+                double lat = _client.GetNumber(DeviceName, "GEOGRAPHIC_COORD", "LAT");
+                bool degrees = az.Value is >= 0 and <= 360 && alt.Value is >= -90 and <= 90;
+                return degrees && double.IsFinite(lat) && Math.Abs(lat) <= 90 ? HaDecFromAltAz(alt.Value, az.Value, lat) : null;
+            }
+            if (!park.Values.TryGetValue("PARK_RA", out var raStep) || !park.Values.TryGetValue("PARK_DEC", out var deStep)) return null;
+            if (_client.GetText(DeviceName, "DRIVER_INFO", "DRIVER_EXEC") != "indi_eqmod_telescope") return null;
+            if (_client.GetProperty(DeviceName, "HEMISPHERE") is not IndiSwitchProperty) return null;
+            double raTotal = _client.GetNumber(DeviceName, "STEPPERS", "RASteps360");
+            double deTotal = _client.GetNumber(DeviceName, "STEPPERS", "DESteps360");
+            if (!(raTotal > 0) || !(deTotal > 0)) return null;
+            var p = EqmodEncodersToHaDec(raStep.Value, deStep.Value, raTotal, deTotal,
+                _client.GetSwitch(DeviceName, "HEMISPHERE", "SOUTH"));
+            return (p.HaHours, p.DecDeg);
+        }
+    }
+
+    /// <summary>EQMod's encoder model (indi-eqmod EncodersToRADec): both
+    /// axes count from 0x800000; the RA axis gives an hour angle, the Dec
+    /// axis an angle that maps to Dec and pier side, mirrored in the
+    /// southern hemisphere. Returns the true hour angle (-12..12, positive
+    /// west) and Dec of date. Checked against a live HEQ5: encoders
+    /// 6640600 / 11579435 in the south read RA 6.4100 h at LST 5.0590 h
+    /// (HA -1.3510 h), Dec -52.706°, pier west.</summary>
+    public static (double HaHours, double DecDeg, bool PierEast) EqmodEncodersToHaDec(
+            double raStep, double deStep, double raTotal, double deTotal, bool south) {
+        const double zero = 0x800000;
+        static double R(double x, double m) => ((x % m) + m) % m;
+        double h = R(-24.0 * (raStep - zero) / raTotal, 24);
+        double haCur = south ? R(24 - h + 6, 24) : R(h + 6, 24);
+        double d = R(360.0 * (deStep - zero) / deTotal, 360);
+        double deCur = south ? R(360 - d, 360) : d;
+        bool east = south ? (deCur <= 90 || deCur > 270) : (deCur > 90 && deCur <= 270);
+        // EQMod: RA = haCur + LST (+12 h on the east side in the south,
+        // -12 h in the north), so the true hour angle LST - RA is:
+        double ha = -haCur - (east ? (south ? 12 : -12) : 0);
+        ha = R(ha + 12, 24) - 12;
+        double dec = deCur > 270 ? deCur - 360 : deCur > 90 ? 180 - deCur : deCur;
+        return (ha, dec, east);
+    }
+
+    private static (double HaHours, double DecDeg) HaDecFromAltAz(double altDeg, double azDeg, double latDeg) {
+        double a = altDeg * Math.PI / 180, A = azDeg * Math.PI / 180, f = latDeg * Math.PI / 180;
+        double sinDec = Math.Sin(f) * Math.Sin(a) + Math.Cos(f) * Math.Cos(a) * Math.Cos(A);
+        double dec = Math.Asin(Math.Clamp(sinDec, -1, 1));
+        double ha = Math.Atan2(-Math.Sin(A) * Math.Cos(a), Math.Cos(f) * Math.Sin(a) - Math.Sin(f) * Math.Cos(a) * Math.Cos(A));
+        return (ha * 12 / Math.PI, dec * 180 / Math.PI);
+    }
+
     public double Altitude => _client.GetNumber(DeviceName, "HORIZONTAL_COORD", "ALT");
     public double Azimuth => _client.GetNumber(DeviceName, "HORIZONTAL_COORD", "AZ");
     public bool IsTracking => _client.GetSwitch(DeviceName, "TELESCOPE_TRACK_STATE", "TRACK_ON");
     public bool IsParked => _client.GetSwitch(DeviceName, "TELESCOPE_PARK", "PARK");
+    public bool IsParking =>
+        _client.GetProperty(DeviceName, "TELESCOPE_PARK")?.State == Protocol.IndiPropertyState.Busy;
     public bool IsSlewing {
         get {
             var prop = _client.GetProperty(DeviceName, "EQUATORIAL_EOD_COORD");
@@ -367,6 +443,104 @@ public class IndiTelescope : ITelescope {
         }
         payload[chosen] = true;
         await _client.SetSwitchAsync(DeviceName, "TELESCOPE_HOME", payload, ct);
+    }
+
+    /// <summary>True when the driver can park at its own default park
+    /// position: a TELESCOPE_PARK_OPTION with PARK_DEFAULT next to a
+    /// TELESCOPE_PARK_POSITION to save and put back. On EQMod the default
+    /// park is the position the motor counters start from at power on
+    /// (counterweight down, OTA on the pole).</summary>
+    private bool CanParkAtDefault =>
+        _client.GetProperty(DeviceName, "TELESCOPE_PARK") != null
+        && _client.GetProperty(DeviceName, "TELESCOPE_PARK_POSITION") is IndiNumberProperty
+        && _client.GetProperty(DeviceName, "TELESCOPE_PARK_OPTION") is IndiSwitchProperty opt
+        && opt.Values.ContainsKey("PARK_DEFAULT");
+
+    /// <summary>Back to the position the mount was in when it was powered on.
+    /// A driver with TELESCOPE_HOME uses it (Find Home). Otherwise, for
+    /// drivers such as EQMod with no home property, the mount parks at the
+    /// driver's default park position, the user's own park position is put
+    /// back, and the mount is unparked with tracking off, as it was at power
+    /// on. Returns once the mount is there; throws if the park is stopped or
+    /// fails, with the user's park position put back either way.</summary>
+    public async Task GoToHomeAsync(CancellationToken ct = default) {
+        if (Capabilities.SupportsFindHome) { await FindHomeAsync(ct); return; }
+        if (!CanParkAtDefault)
+            throw new NotSupportedException(
+                $"Mount '{DeviceName}' has neither TELESCOPE_HOME nor a default park position, so it cannot go home.");
+        if (IsParked) throw new InvalidOperationException("Unpark the mount first.");
+
+        var saved = ((IndiNumberProperty)_client.GetProperty(DeviceName, "TELESCOPE_PARK_POSITION")!)
+            .Values.ToDictionary(kv => kv.Key, kv => kv.Value.Value);
+        try {
+            var opt = await _client.SetSwitchAsyncAck(DeviceName, "TELESCOPE_PARK_OPTION",
+                OneOf("TELESCOPE_PARK_OPTION", "PARK_DEFAULT"), ct: ct);
+            ThrowIfRejectedOrTimedOut(opt, "default park position", "TELESCOPE_PARK_OPTION");
+            await SetTrackingAsync(false, ct);
+            await ParkAsync(ct);
+            await WaitForParkAsync(TimeSpan.FromMinutes(5), ct);
+        } finally {
+            // Put the user's park position back whatever happened, so the
+            // next Park goes where it always did. The driver writes its park
+            // data to disk when the park completes, so write it back too.
+            try {
+                var current = (_client.GetProperty(DeviceName, "TELESCOPE_PARK_POSITION") as IndiNumberProperty)?
+                    .Values.ToDictionary(kv => kv.Key, kv => kv.Value.Value);
+                if (current == null || saved.Any(kv => !current.TryGetValue(kv.Key, out var v) || v != kv.Value)) {
+                    var ack = await _client.SetNumberAsyncAck(DeviceName, "TELESCOPE_PARK_POSITION", saved,
+                        ct: CancellationToken.None);
+                    ThrowIfRejectedOrTimedOut(ack, "restore park position", "TELESCOPE_PARK_POSITION");
+                    if (IsParked) {
+                        // Parked at home now: the on-disk park data holds the
+                        // default, so write the restored position over it.
+                        var w = await _client.SetSwitchAsyncAck(DeviceName, "TELESCOPE_PARK_OPTION",
+                            OneOf("TELESCOPE_PARK_OPTION", "PARK_WRITE_DATA"), ct: CancellationToken.None);
+                        ThrowIfRejectedOrTimedOut(w, "save park position", "TELESCOPE_PARK_OPTION");
+                    }
+                }
+            } catch (Exception ex) {
+                _client.DiagLogger.LogWarning(ex,
+                    "Mount '{Device}': could not put the park position back to {Saved} after Go-To Home",
+                    DeviceName, string.Join(", ", saved.Select(kv => $"{kv.Key}={kv.Value}")));
+            }
+        }
+        // At home and parked. Unpark (tracking stays off), as at power on.
+        await UnparkAsync(ct);
+        await WaitUntilAsync(() => !IsParked, TimeSpan.FromSeconds(30), ct);
+    }
+
+    /// <summary>A OneOfMany payload with only <paramref name="on"/> set,
+    /// over the elements the driver advertises.</summary>
+    private Dictionary<string, bool> OneOf(string property, string on) {
+        var payload = (_client.GetProperty(DeviceName, property) as IndiSwitchProperty)?
+            .Values.Keys.ToDictionary(k => k, _ => false) ?? new Dictionary<string, bool>();
+        payload[on] = true;
+        return payload;
+    }
+
+    /// <summary>Wait for a park to finish: PARK on with the property Ok.
+    /// The switch can read PARK while the slew is still Busy. A stop
+    /// (Abort) leaves it Idle or Alert with PARK off.</summary>
+    private async Task WaitForParkAsync(TimeSpan timeout, CancellationToken ct) {
+        var deadline = DateTime.UtcNow + timeout;
+        // Give the driver a moment to turn the property Busy.
+        await Task.Delay(500, ct);
+        while (DateTime.UtcNow < deadline) {
+            var p = _client.GetProperty(DeviceName, "TELESCOPE_PARK");
+            if (p?.State == IndiPropertyState.Ok && IsParked) return;
+            if (p?.State == IndiPropertyState.Alert)
+                throw new InvalidOperationException(
+                    $"Mount '{DeviceName}' stopped on the way home: {p.Message ?? "park failed"}");
+            if (p?.State == IndiPropertyState.Idle && !IsParked)
+                throw new OperationCanceledException("Go-To Home was stopped before the mount got there.");
+            await Task.Delay(250, ct);
+        }
+        throw new TimeoutException($"Mount '{DeviceName}' did not reach home within {timeout.TotalMinutes:0} minutes.");
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> done, TimeSpan timeout, CancellationToken ct) {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline && !done()) await Task.Delay(250, ct);
     }
 
     /// <summary>Push the observer's geographic coordinates into the

@@ -53,6 +53,8 @@ public class EquipmentManager : IDisposable {
     /// plug in here without touching the capture / sequencing code.
     /// See <c>docs/mounts-wifi.md</c> for the open driver work.</summary>
     public ITelescope? Telescope { get; private set; }
+    /// <summary>MOUNTVIEW: the background Go-To Home, reported in the telescope status.</summary>
+    public MountGoHomeRun GoHome { get; private set; } = null!;
     /// <summary>Mount driver kind currently bound to <see cref="Telescope"/>.
     /// Mirrors <c>EquipmentProfile.TelescopeDriver</c>. Null when no
     /// mount is selected.</summary>
@@ -91,6 +93,7 @@ public class EquipmentManager : IDisposable {
                             AlpacaDiscoveryCache alpacaCache, SimGearService simGear,
                             ProfileService? profiles = null) {
         _indiClient = indiClient;
+        GoHome = new MountGoHomeRun(logger);
         _logger = logger;
         _alpacaCache = alpacaCache;
         _simGear = simGear;
@@ -1225,8 +1228,19 @@ public class EquipmentManager : IDisposable {
                 az = Safe(scopeAz),
                 tracking = Telescope.IsTracking,
                 slewing = Telescope.IsSlewing,
-                parked = Telescope.IsParked,
+                parked = Telescope.IsParked && !Telescope.IsParking,
+                // MOUNTVIEW: a park on its way (PARK set, not there yet), and Go-To Home.
+                parking = Telescope.IsParking,
+                goingHome = GoHome.Running,
+                goHome = new { run = GoHome.Run, error = GoHome.LastError, method = GoHome.LastMethod },
+                // MOUNTVIEW: the park position, when the driver publishes it in
+                // units we can read (null otherwise).
+                park = MountHorizontal.ParkPointing(Telescope, _profiles?.Active.Longitude ?? 0, DateTime.UtcNow),
                 pierSide = Telescope.SideOfPier.ToString(),
+                // MOUNTVIEW: RA axis pose for the Focus Stars page. Not derivable in
+                // the browser from the J2000 ra above when the scope is on the pole.
+                hourAngle = Safe(MountHorizontal.HourAngle(Telescope,
+                    _profiles?.Active.Longitude ?? 0, DateTime.UtcNow) ?? double.NaN),
                 slewRates = slewRates.Select(r => new {
                     name = r.Name, label = r.Label, active = r.Active
                 }).ToArray(),
@@ -1240,6 +1254,7 @@ public class EquipmentManager : IDisposable {
                     pierSide = caps.SupportsPierSide,
                     manualJog = caps.SupportsManualJog,
                     findHome = caps.SupportsFindHome,
+                    goToHome = MountGoHomeRun.CanGoHome(caps),
                     setSiteLocation = caps.SupportsSetSiteLocation,
                     setSiteTime = caps.SupportsSetSiteTime,
                     trackingModes = caps.SupportsTrackingModes

@@ -3,7 +3,7 @@
 Manual focuser control + Manual Assist loop (HFR trend + Bahtinov
 mask) + automated V-curve focusing with live frame preview.
 
-The tab has two subtabs:
+The tab has four subtabs:
 
 - **Manual Assist** (default): a loop-based focus aid that captures
   a frame every N seconds, plots HFR vs time, and (optionally) runs
@@ -12,6 +12,12 @@ The tab has two subtabs:
   doubles as a fine-tune aid for motorised rigs after a V-curve.
 - **Auto V-curve**: the classic automated sweep. Requires an
   electronic focuser; disabled when none is connected.
+- **Filter offsets**: one autofocus per filter, to measure each
+  filter's focus offset. Requires an electronic focuser and a filter
+  wheel.
+- **[Focus Stars](mount-view.md)**: bright stars well placed to focus
+  on now, on a live 3D view of the mount and the sky, with Slew Star
+  and Solve & Sync. Needs a mount, not a focuser.
 
 The motor stepper (manual position control) lives **above** the
 subtabs whenever an electronic focuser is connected, so you can drive

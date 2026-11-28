@@ -74,10 +74,30 @@ public interface ITelescope {
     bool IsTracking { get; }
     bool IsParked { get; }
     bool IsSlewing { get; }
+    /// <summary>A park on its way: asked for, the mount not there yet.
+    /// IsParked can already read true then on INDI. Default false.</summary>
+    bool IsParking => false;
 
     /// <summary>Pier side for GEM mounts. <see cref="PierSide.pierUnknown"/>
     /// for alt-az / fork mounts and for drivers that don't expose it.</summary>
     PierSide SideOfPier { get; }
+
+    /// <summary>Hour angle of the mount's own pointing of date, in hours
+    /// (-12..12, positive west), when the backend can read it without going
+    /// through <see cref="RightAscension"/>; null when it cannot. The MOUNT
+    /// tab poses the RA axis with it. On the pole every RA axis angle is the
+    /// same J2000 point, so LST minus a J2000 RA loses the axis there, while
+    /// a driver's own RA of date still follows it. <c>MountHorizontal.HourAngle</c>
+    /// falls back to LST minus the pointing of date when this is null.</summary>
+    double? HourAngle => null;
+
+    /// <summary>MOUNTVIEW: where the mount's park position points, as hour
+    /// angle (hours, -12..12, positive west) and Dec of date, when the
+    /// backend can read it; null when it cannot. A park position is fixed
+    /// to the mount, not the stars, hence hour angle rather than RA.
+    /// ASCOM / Alpaca have no way to read it back; INDI publishes it in
+    /// TELESCOPE_PARK_POSITION, in units that depend on the driver.</summary>
+    (double HaHours, double DecDeg)? ParkHaDec => null;
 
     /// <summary>Which optional features the backend supports. Drives
     /// UI affordances (Park button hidden when the driver can't park,
@@ -136,6 +156,14 @@ public interface ITelescope {
     /// the button.</summary>
     Task FindHomeAsync(CancellationToken ct = default) =>
         throw new NotSupportedException("FindHome not supported by this mount driver");
+
+    /// <summary>Send the mount back to the position it was in when it was
+    /// powered on, before any slew or tracking. Unlike Find Home this also
+    /// works on drivers with no home property (EQMod parks at its default
+    /// park position, which is the power-on position). Returns once the
+    /// mount is there. The default runs Find Home; UI checks
+    /// <see cref="MountCapabilities.SupportsGoToHome"/>.</summary>
+    Task GoToHomeAsync(CancellationToken ct = default) => FindHomeAsync(ct);
 
     /// <summary>Push the observer's geographic position into the mount.
     /// Critical for GoTo accuracy: every mount internally converts
@@ -263,7 +291,8 @@ public record MountCapabilities(
     bool SupportsSetSiteLocation = false,
     bool SupportsSetSiteTime = false,
     bool SupportsTrackingModes = false,
-    bool SupportsPulseGuide = false) {
+    bool SupportsPulseGuide = false,
+    bool SupportsGoToHome = false) {
     /// <summary>Typical equatorial GEM profile (INDI / ASCOM / direct
     /// WiFi serial-protocol mounts), everything available.
     /// FindHome defaults true here -- most GEM mounts expose it via

@@ -44,7 +44,7 @@
          ?v= cache-bust token, bumped together on every deploy. -->
     <link rel="stylesheet" href="/css/parts/01-base-statusbar.css?v=20261112-navorder">
     <link rel="stylesheet" href="/css/parts/02-imaging-panels.css?v=20261126-tapfocus">
-    <link rel="stylesheet" href="/css/parts/03-equipment-mount.css?v=20261119-modalscroll">
+    <link rel="stylesheet" href="/css/parts/03-equipment-mount.css?v=20261128-focusstars">
     <link rel="stylesheet" href="/css/parts/04-focus-settings.css?v=20261127-skyrotcard">
     <link rel="stylesheet" href="/css/parts/05-inputs-forms.css?v=20261119-modalscroll">
     <link rel="stylesheet" href="/css/parts/06-modals-overlays.css?v=20261011-kblift">
@@ -3221,6 +3221,11 @@
                         Filter offsets
                         <span x-show="!focusConnected || !filterWheel.connected" style="opacity:0.6">·</span>
                     </button>
+                    <!-- No focuser needed: picking a star and slewing to it is
+                         the first step of focusing, by hand or with a motor. -->
+                    <button class="video-tab" :class="{ active: focusTab === 'stars' }"
+                            @click="focusTab = 'stars'"
+                            title="Bright stars to focus on, on a live view of the mount and the sky">Focus Stars</button>
                 </div>
 
                 <!-- ===== Manual Assist subtab ===== -->
@@ -3958,6 +3963,266 @@
 
                 </div>
                 </div><!-- /focusTab === 'filters' wrapper -->
+
+                <!-- ===== Focus Stars subtab (MOUNTVIEW) =====
+                     Live 3D model of the mount, posed from the status
+                     socket's alt/az + pier side by js/mount-view.js, in
+                     front of the night sky, with the bright stars best
+                     placed to focus on. The mount controls are the shared
+                     floating Mount control (same methods as everywhere). -->
+                <div x-show="focusTab === 'stars'" class="focus-stars-pane"
+                     x-init="$watch('settings.latitude', () => mountViewPush())">
+                    <div class="mountview-layout">
+                        <div class="mountview-stage">
+                            <canvas x-ref="mountViewCanvas" class="mountview-canvas"
+                                    aria-label="3D view of the mount"></canvas>
+                            <div class="mountview-empty" x-show="!mount.connected">Connect a mount in RIGS first</div>
+                            <!-- Bottom bar, from the left as on SKY: Slew Star (the
+                                 selected focus star), Slew Center (the red mark),
+                                 Home, pointing recovery (the SKY tab's Solve & Sync,
+                                 and Sync here on the red mark), and the Mount pill.
+                                 A double tap on the sky resets the view. -->
+                            <div class="sky-map-overlay-actions mountview-bottombar">
+                                <!-- GoTo the focus star chosen in the list or tapped on the sky. -->
+                                <button class="btn btn-sm btn-primary" @click="focusStarSlew(focusStarSelectedItem())"
+                                        :disabled="!focusStarSelectedItem() || !mount.connected || mount.parked || mount.slewing"
+                                        :title="focusStarSelectedItem() ? 'Slew the mount to the selected star' : 'Select a focus star first'">Slew Star</button>
+                                <!-- GoTo the red centre mark (refused below the horizon). -->
+                                <button class="btn btn-sm" @click="mountViewSlewCentre()"
+                                        :disabled="!mount.connected || mount.parked || mount.slewing"
+                                        title="Slew the mount to the red mark in the middle of the sky view">Slew Center</button>
+                                <!-- Back to the power-on position; a mount with no home
+                                     position goes to its park position, left unparked. -->
+                                <button class="btn btn-sm" @click="mountGoToHome()"
+                                        :disabled="!mount.connected || !mount.capabilities?.goToHome || mount.parked || mount.slewing || mount.parking || mount.goingHome"
+                                        title="Send the mount back to where it was when it was turned on: counterweight down, pointing at the pole. A mount with no home position goes to its park position and is left unparked.">
+                                    <span x-text="mount.goingHome ? 'Going home...' : 'Home'"></span>
+                                </button>
+                                <button class="btn btn-sm" @click="solveAndSyncHere()"
+                                        x-show="!solveSyncBusy"
+                                        :disabled="!mount.connected"
+                                        title="Capture a frame, plate solve it and sync the mount to it, without moving">
+                                    Solve &amp; Sync
+                                </button>
+                                <button class="btn btn-sm btn-danger" @click="cancelSolveSync()" x-show="solveSyncBusy"
+                                        title="Stop the capture and plate solve">Solving… Abort</button>
+                                <button class="btn btn-sm" @click="mountViewSyncCentre()"
+                                        title="Tell the mount it is pointing at the red mark in the middle of the sky view, without moving. Drag the sky until the mark is on what the scope really points at first. Use it to recover pointing when you can't plate-solve. Confirms first.">Sync here</button>
+                                <!-- The Mount pill: shows or hides the shared floating
+                                     Mount control, as on SKY, FOCUS, PREVIEW and LIVE. -->
+                                <button class="btn btn-sm"
+                                        :class="mountPanel.visible ? 'btn-active' : ''"
+                                        @click="toggleMountPanel($event)"
+                                        @contextmenu.prevent="resetMountPanelPosition(); mountPanel.visible = true"
+                                        :disabled="!mount.connected"
+                                        :title="!mount.connected ? 'Connect a mount in RIGS first'
+                                               : (mountPanel.visible ? 'Hide' : 'Show') + ' mount control (shift+click or right-click resets position)'">
+                                    <svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true" style="vertical-align:-1px">
+                                        <path d="M12 2L2 22h20L12 2z" fill="none" stroke="currentColor" stroke-width="2"/>
+                                    </svg>
+                                    Mount
+                                </button>
+                            </div>
+                            <!-- Top left corner: where the scope, the red mark and
+                                 the selected star are. -->
+                            <div class="mountview-topleft">
+                                <!-- Positions, J2000: the scope (the blue reticle,
+                                     the mount's reported position), the red centre
+                                     mark (what Sync here and Slew Center use), the
+                                     mount's home (the yellow mark) and park position
+                                     (magenta, when the driver's can be read), and the
+                                     selected focus star. -->
+                                <div class="mountview-status">
+                                    <div>
+                                        <span class="mountview-status-k mountview-status-scope">Scope</span>
+                                        <template x-if="mount.connected && Number.isFinite(Number(mount.ra)) && Number.isFinite(Number(mount.dec))">
+                                            <span><span class="mountview-status-k">RA</span> <span x-text="formatRA(Number(mount.ra))"></span>
+                                                <span class="mountview-status-k">Dec</span> <span x-text="formatDec(Number(mount.dec))"></span></span>
+                                        </template>
+                                        <span x-show="!mount.connected" class="text-muted">Mount not connected</span>
+                                    </div>
+                                    <div x-show="mountViewCentre">
+                                        <span class="mountview-status-k mountview-status-centre">Centre</span>
+                                        <span class="mountview-status-k">RA</span> <span x-text="mountViewCentre ? formatRA(mountViewCentre.raHours) : ''"></span>
+                                        <span class="mountview-status-k">Dec</span> <span x-text="mountViewCentre ? formatDec(mountViewCentre.decDeg) : ''"></span>
+                                    </div>
+                                    <div x-show="mountViewHomeRaDec()">
+                                        <span class="mountview-status-k mountview-status-home">Home</span>
+                                        <span class="mountview-status-k">RA</span> <span x-text="mountViewHomeRaDec() ? formatRA(mountViewHomeRaDec().raHours) : ''"></span>
+                                        <span class="mountview-status-k">Dec</span> <span x-text="mountViewHomeRaDec() ? formatDec(mountViewHomeRaDec().decDeg) : ''"></span>
+                                    </div>
+                                    <div x-show="mount.connected && mount.park">
+                                        <span class="mountview-status-k mountview-status-park">Park</span>
+                                        <span class="mountview-status-k">RA</span> <span x-text="mount.park ? formatRA(mount.park.ra) : ''"></span>
+                                        <span class="mountview-status-k">Dec</span> <span x-text="mount.park ? formatDec(mount.park.dec) : ''"></span>
+                                    </div>
+                                    <div x-show="focusStarSelectedItem()">
+                                        <span class="mountview-status-k mountview-status-star">Star</span>
+                                        <span class="mountview-status-k">RA</span> <span x-text="focusStarSelectedItem() ? formatRA(focusStarSelectedItem().raHours) : ''"></span>
+                                        <span class="mountview-status-k">Dec</span> <span x-text="focusStarSelectedItem() ? formatDec(focusStarSelectedItem().decDeg) : ''"></span>
+                                        <span class="mountview-status-name" x-text="focusStarSelectedItem() ? '(' + focusStarSelectedItem().name + ')' : ''"></span>
+                                    </div>
+                                </div>
+                            </div>
+                            <!-- View toolbar. -->
+                            <div class="mountview-toolbar">
+                                <!-- Which mount to draw: EQ (the default, shown active) or Alt-AZ. -->
+                                <button class="btn btn-sm" @click="cycleMountViewModel()"
+                                        :class="mountViewModel === 'gem' ? 'btn-active' : ''"
+                                        x-text="mountViewModelLabel()"
+                                        title="Which kind of mount to draw: EQ (German equatorial) or Alt-AZ"></button>
+                                <!-- Coordinate grid on the sky, cycled like SKY's. -->
+                                <button class="btn btn-sm" @click="cycleMountViewGrid()"
+                                        :class="mountViewGrid !== 'none' ? 'btn-active' : ''"
+                                        x-text="'#️⃣ ' + mountViewGridLabel()"
+                                        title="Toggle the sky coordinate grid: off → Alt-Az → Equatorial"></button>
+                                <!-- Opens the focus star list, a drop-down over the sky. -->
+                                <button class="btn btn-sm mountview-stars-toggle" @click="mountViewStarsOpen = !mountViewStarsOpen"
+                                        :class="mountViewStarsOpen ? 'btn-active' : ''"
+                                        aria-haspopup="dialog" aria-controls="mountview-stars" :aria-expanded="mountViewStarsOpen ? 'true' : 'false'"
+                                        title="Open the list of bright stars well placed to focus on now">
+                                    <span>Focus stars</span>
+                                    <svg class="mountview-caret" :class="mountViewStarsOpen ? 'open' : ''" viewBox="0 0 10 6" width="10" height="6" aria-hidden="true">
+                                        <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                                    </svg>
+                                </button>
+                            </div>
+                            <!-- MOUNTVIEW: bright stars well placed to focus on now, like the
+                                 TPPA start chips on POLAR. /api/focus/stars ranks the
+                                 Hipparcos stars to mag 6.5 by brightness within the
+                                 magnitude range, altitude over the custom horizon for
+                                 the next 20 min, a short slew, distance from the Moon
+                                 and no meridian crossing mid-focus. A drop-down over the
+                                 sky from the Focus stars button: choosing a star turns
+                                 the view to it and closes the list; Slew is in the
+                                 bottom bar. -->
+                            <section class="mountview-stars" aria-label="Focus stars" id="mountview-stars"
+                                     x-show="mountViewStarsOpen" x-transition.opacity.duration.150ms
+                                     @keydown.escape.window="mountViewStarsOpen = false">
+                                <div class="mountview-stars-head">
+                                    <span class="hint">Bright stars high in the sky now, best first</span>
+                                    <button class="btn btn-sm" @click="loadFocusStars()" :disabled="focusStars.loading"
+                                            title="Refresh for the current time, site and mount position">
+                                        <span x-show="!focusStars.loading">Refresh</span>
+                                        <span x-show="focusStars.loading">Loading…</span>
+                                    </button>
+                                    <button class="btn btn-sm" @click="focusStarSelect(null)"
+                                            :disabled="!focusStarSelectedItem()"
+                                            title="Deselect the star">Clear</button>
+                                    <button type="button" class="btn btn-xs mountview-stars-close" @click="mountViewStarsOpen = false"
+                                            aria-label="Close" title="Close">&times;</button>
+                                </div>
+                                <div class="mountview-stars-body">
+                                    <!-- Limits, one per line, each switched on or off by
+                                         its checkbox. Ticked, a limit leaves stars out;
+                                         unticked, it leaves none out but still ranks at
+                                         half weight. Stars always clear the custom horizon.
+                                         Any change refetches (debounced) and is remembered
+                                         in this browser. -->
+                                    <div class="mountview-stars-limits">
+                                        <!-- Two boxes, -1.5 (Sirius) to 6.5 (naked eye).
+                                             They never cross: a min above the max stops
+                                             at the max, and the other way round. -->
+                                        <div class="mountview-stars-limit" title="Show stars between these magnitudes. Lower numbers are brighter; the brightest stars saturate and bloom, so they rank lower than the bright end of the range.">
+                                            <label class="mountview-stars-limit-name">
+                                                <input type="checkbox" :checked="focusStars.useMag"
+                                                       @change="focusStarsSetLimit('useMag', $event.target.checked)">
+                                                <span>Magnitude range</span>
+                                            </label>
+                                            <input type="number" min="-1.5" max="6.5" step="0.1" inputmode="decimal" aria-label="Brightest magnitude"
+                                                   :value="focusStars.minMag"
+                                                   @change="focusStarsSetLimit('minMag', $event.target.value); $event.target.value = focusStars.minMag">
+                                            <span>to</span>
+                                            <input type="number" min="-1.5" max="6.5" step="0.1" inputmode="decimal" aria-label="Faintest magnitude"
+                                                   :value="focusStars.maxMag"
+                                                   @change="focusStarsSetLimit('maxMag', $event.target.value); $event.target.value = focusStars.maxMag">
+                                        </div>
+                                        <div class="mountview-stars-limit"
+                                             title="Lowest altitude above the horizon a star may have, now and for the next 20 minutes">
+                                            <label class="mountview-stars-limit-name">
+                                                <input type="checkbox" :checked="focusStars.useAlt"
+                                                       @change="focusStarsSetLimit('useAlt', $event.target.checked)">
+                                                <span>Min altitude</span>
+                                            </label>
+                                            <input type="number" min="0" max="85" step="1" inputmode="numeric" aria-label="Min altitude"
+                                                   :value="focusStars.minAlt"
+                                                   @change="focusStarsSetLimit('minAlt', $event.target.value)">
+                                            <span>°</span>
+                                        </div>
+                                        <div class="mountview-stars-limit"
+                                             title="Leave out stars this close to the Moon while it is up. The distance is drawn round the Moon on the sky.">
+                                            <label class="mountview-stars-limit-name">
+                                                <input type="checkbox" :checked="focusStars.avoidMoon"
+                                                       @change="focusStarsSetLimit('avoidMoon', $event.target.checked)">
+                                                <span>Away from the Moon</span>
+                                            </label>
+                                            <input type="number" min="1" max="90" step="1" inputmode="numeric" aria-label="Away from the Moon"
+                                                   :value="focusStars.moonDeg"
+                                                   @change="focusStarsSetLimit('moonDeg', $event.target.value)">
+                                            <span>°</span>
+                                        </div>
+                                        <div class="mountview-stars-limit"
+                                             title="Leave out stars further than this from where the mount points now. Needs a connected mount.">
+                                            <label class="mountview-stars-limit-name">
+                                                <input type="checkbox" :checked="focusStars.useSlew"
+                                                       @change="focusStarsSetLimit('useSlew', $event.target.checked)">
+                                                <span>Max slew</span>
+                                            </label>
+                                            <input type="number" min="1" max="180" step="1" inputmode="numeric" aria-label="Max slew"
+                                                   :value="focusStars.maxSlew"
+                                                   @change="focusStarsSetLimit('maxSlew', $event.target.value)">
+                                            <span>°</span>
+                                        </div>
+                                        <p class="hint mountview-stars-limits-hint">Ticked limits leave stars out. Unticked ones leave none out but still count toward the order, at half weight.</p>
+                                    </div>
+                                    <p class="hint" x-show="!focusStars.items.length && !focusStars.loading">
+                                        No star matches these limits right now. Lower the minimum altitude or raise the magnitude limit.
+                                    </p>
+                                    <div class="mountview-stars-scroll" x-show="focusStars.items.length">
+                                    <table class="mountview-stars-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Star</th>
+                                                <th class="mountview-stars-sort" :aria-sort="focusStars.sortBy === 'magnitude' ? (focusStars.sortDesc ? 'descending' : 'ascending') : 'none'">
+                                                    <button type="button" @click="focusStarsSort('magnitude')"
+                                                            title="Sort by magnitude, largest to smallest; click again to reverse, then again for the ranked order"><span>Mag</span><span x-text="focusStarsSortMark('magnitude')"></span></button>
+                                                </th>
+                                                <th class="mountview-stars-sort" :aria-sort="focusStars.sortBy === 'altDeg' ? (focusStars.sortDesc ? 'descending' : 'ascending') : 'none'">
+                                                    <button type="button" @click="focusStarsSort('altDeg')"
+                                                            title="Sort by altitude, largest to smallest; click again to reverse, then again for the ranked order"><span>Alt</span><span x-text="focusStarsSortMark('altDeg')"></span></button>
+                                                </th>
+                                                <th>Az</th><th>Slew</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <template x-for="s in focusStarsSorted()" :key="s.hip">
+                                                <tr class="mountview-stars-row" tabindex="0"
+                                                    :class="{ selected: focusStarSelected === s.hip }"
+                                                    :aria-selected="focusStarSelected === s.hip ? 'true' : 'false'"
+                                                    @click="focusStarChoose(s)"
+                                                    @keydown.enter.prevent="focusStarChoose(s)"
+                                                    @keydown.space.prevent="focusStarChoose(s)">
+                                                    <td>
+                                                        <strong x-text="s.name"></strong>
+                                                        <span class="text-muted" x-show="s.designation && s.designation !== s.name"
+                                                              x-text="s.designation"></span>
+                                                        <span class="mountview-stars-flag" x-show="s.crossesMeridian"
+                                                              title="Crosses the meridian within 20 minutes: a GEM may flip while you focus">flip</span>
+                                                    </td>
+                                                    <td x-text="s.magnitude.toFixed(1)"></td>
+                                                    <td x-text="s.altDeg.toFixed(0) + '°'"></td>
+                                                    <td x-text="s.azDeg.toFixed(0) + '°'"></td>
+                                                    <td x-text="s.slewDeg != null ? s.slewDeg.toFixed(0) + '°' : '-'"></td>
+                                                </tr>
+                                            </template>
+                                        </tbody>
+                                    </table>
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
+                    </div>
+                </div><!-- /focusTab === 'stars' -->
             </div>
 
             <!-- PREVIEW, snap test shots with optional save -->
@@ -11531,10 +11796,16 @@ cd xpra-html5 &amp;&amp; sudo python3 ./setup.py install</pre>
                                     x-text="mount.tracking ? 'ON' : 'OFF'"></strong>
                         </div>
                         <div class="info-row"><span>Pier:</span><strong x-text="mount.pierSide"></strong></div>
-                        <div class="info-row" x-show="mount.slewing">
+                        <div class="info-row" x-show="mount.goingHome">
+                            <span>Status:</span><strong class="text-warn">GOING HOME</strong>
+                        </div>
+                        <div class="info-row" x-show="!mount.goingHome && mount.parking">
+                            <span>Status:</span><strong class="text-warn">PARKING</strong>
+                        </div>
+                        <div class="info-row" x-show="!mount.goingHome && !mount.parking && mount.slewing">
                             <span>Status:</span><strong class="text-warn">SLEWING</strong>
                         </div>
-                        <div class="info-row" x-show="mount.parked">
+                        <div class="info-row" x-show="!mount.goingHome && mount.parked">
                             <span>Status:</span><strong class="text-warn">PARKED</strong>
                         </div>
                     </div>
@@ -20894,6 +21165,7 @@ Windows  winget install Rclone.Rclone</code></pre>
                                     <p><a href="https://novnc.com/" target="_blank" rel="noopener"><strong>noVNC</strong></a> - the noVNC authors. The embedded PHD2 GUI on Windows (MPL-2.0).</p>
                                     <p><a href="https://xtermjs.org/" target="_blank" rel="noopener"><strong>xterm.js</strong></a> - the xterm.js authors. In-browser terminal.</p>
                                     <p><a href="https://github.com/mourner/suncalc" target="_blank" rel="noopener"><strong>SunCalc</strong></a> - Vladimir Agafonkin. Sun / twilight calculations for the sky view.</p>
+                                    <p><a href="https://www.iau.org/public/themes/naming_stars/" target="_blank" rel="noopener"><strong>IAU Catalog of Star Names</strong></a> - IAU Working Group on Star Names (WGSN), CC BY 4.0. Star names in the FOCUS tab Focus Stars list.</p>
                                     <p><a href="https://sortablejs.github.io/Sortable/" target="_blank" rel="noopener"><strong>SortableJS</strong></a> - the SortableJS contributors. Drag-and-drop in the sequencer.</p>
                                 </div>
                             </details>
@@ -26986,7 +27258,8 @@ certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "polaris-root" \
                             });
                         })();
                     </script>
-    <script src="/js/app.js?v=20261126-tapfocus"></script>
+    <script src="/js/mount-view.js?v=20261128-focusstars"></script>
+    <script src="/js/app.js?v=20261128-focusstars"></script>
     <!-- Interactive introductory tour. Self-contained; reads window.__alpineRoot
          only for navigation, issues no API calls (additive + isolated). -->
     <script src="/js/tour.js?v=20260728-bartour"></script>

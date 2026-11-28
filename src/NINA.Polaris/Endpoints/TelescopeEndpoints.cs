@@ -267,6 +267,31 @@ public static class TelescopeEndpoints {
             }
         });
 
+        // MOUNTVIEW: Go-To Home, back to the power-on position (counterweight
+        // down, OTA on the pole). Unlike /find-home it also works on drivers
+        // with no home property: EQMod parks at its default park position and
+        // the user's own park position is put back afterwards. A mount with
+        // neither goes to its park position and is unparked again. The move runs
+        // in the background (it outlasts the browser's request timeout); the
+        // status socket reports goingHome and then the result in goHome.
+        group.MapPost("/goto-home", (EquipmentManager equip, MountSafetyGuardService guard) => {
+            var t = equip.Telescope;
+            if (t == null)
+                return Results.BadRequest(new { error = "No telescope selected" });
+            if (!t.IsConnected)
+                return Results.BadRequest(new { error = "Mount is not connected" });
+            if (!MountGoHomeRun.CanGoHome(t.Capabilities))
+                return Results.Json(new { error = "This mount has no home or park position" }, statusCode: 501);
+            if (t.IsParked)
+                return Results.Conflict(new { error = "Unpark the mount first" });
+            if (t.IsSlewing)
+                return Results.Conflict(new { error = "The mount is already moving" });
+            // Back at a known position: clear a standing safety stop (guard gate #4).
+            if (!equip.GoHome.TryStart(t, guard.Reset))
+                return Results.Conflict(new { error = "The mount is already going home" });
+            return Results.Accepted(value: new { status = "going-home" });
+        });
+
         // Reset-then-home dance for strain-wave mounts (ZWO AM3 in
         // particular) whose drivers lose the internal position
         // reference on power-up. After power-on, Find Home alone

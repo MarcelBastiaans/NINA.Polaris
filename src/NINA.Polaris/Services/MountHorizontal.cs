@@ -42,6 +42,37 @@ public static class MountHorizontal {
         return AltitudeService.RaDecToAltAz(ra, dec, utc, latDeg, lonDeg);
     }
 
+    /// <summary>The mount's hour angle in hours (-12..12, positive west), for
+    /// posing the RA axis: the backend's own when it has one
+    /// (<see cref="ITelescope.HourAngle"/>), else the site's LST minus the
+    /// pointing of date. The fallback is exact except with the scope on the
+    /// pole, where the J2000 round trip loses the RA axis. Null when there is
+    /// no pointing.</summary>
+    public static double? HourAngle(ITelescope scope, double lonDeg, DateTime utc) {
+        try {
+            if (scope.HourAngle is double own && double.IsFinite(own)) return own;
+        } catch { /* fall back */ }
+        double ra;
+        try { ra = scope.PointingOfDate().RaHours; } catch { return null; }
+        if (!double.IsFinite(ra)) return null;
+        double lst = PolarAlignmentMath.LocalSiderealHours(utc, double.IsFinite(lonDeg) ? lonDeg : 0);
+        return ((((lst - ra) % 24) + 36) % 24) - 12;
+    }
+
+    /// <summary>MOUNTVIEW: the park position for the status feed: hour angle
+    /// and Dec of date (where the Focus Stars sky draws it) and the J2000 RA/Dec
+    /// it points at now (for the positions table). Null when the backend
+    /// cannot read its park position.</summary>
+    public static object? ParkPointing(ITelescope scope, double lonDeg, DateTime utc) {
+        (double HaHours, double DecDeg)? p;
+        try { p = scope.ParkHaDec; } catch { return null; }
+        if (p is not { } park || !double.IsFinite(park.HaHours) || !double.IsFinite(park.DecDeg)) return null;
+        double lst = PolarAlignmentMath.LocalSiderealHours(utc, double.IsFinite(lonDeg) ? lonDeg : 0);
+        double raDate = ((lst - park.HaHours) % 24 + 24) % 24;
+        var j2000 = NINA.Core.Utility.EquatorialEpoch.JNowToJ2000(raDate, park.DecDeg, utc);
+        return new { ha = park.HaHours, decDate = park.DecDeg, ra = j2000.RaHours, dec = j2000.DecDeg };
+    }
+
     /// <summary>Computed from RA/Dec when the driver has no horizontal pair,
     /// or when the mount is equatorial and the site is known.</summary>
     internal static bool PreferComputed(double driverAlt, double driverAz, bool equatorial,

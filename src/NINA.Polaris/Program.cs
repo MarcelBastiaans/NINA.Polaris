@@ -619,6 +619,8 @@ builder.Services.AddSingleton<PolarAlignmentService>();
 // PA-6: TPPA target suggester. Pure read against the catalog + altitude
 // helpers, no state, fine as a singleton.
 builder.Services.AddSingleton<PolarTppaTargetService>();
+// MOUNTVIEW: bright stars to focus on now (Focus Stars page), from the SKY map's Hipparcos tiles.
+builder.Services.AddSingleton<NINA.Polaris.Services.Focus.FocusStarService>();
 builder.Services.AddSingleton<NINA.Polaris.Services.Alpaca.AlpacaDiscovery>();
 builder.Services.AddSingleton<NINA.Polaris.Services.Alpaca.AlpacaDiscoveryCache>();
 builder.Services.AddSingleton<StellariumClient>();
