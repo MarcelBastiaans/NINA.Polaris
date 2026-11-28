@@ -11925,12 +11925,15 @@ cd xpra-html5 &amp;&amp; sudo python3 ./setup.py install</pre>
                                 @click="tonight.filter = c.key"
                                 x-text="c.label"></button>
                     </template>
-                    <label class="tonight-filter-chip tonight-filter-toggle"
-                           :class="{ active: tonight.fitsFovOnly, disabled: !tonightHasFovData() }"
-                           :title="tonightHasFovData() ? 'Show only objects that fit your current camera FOV' : 'Connect a camera to enable this filter'">
-                        <input type="checkbox" x-model="tonight.fitsFovOnly" :disabled="!tonightHasFovData()" style="display:none">
-                        Fits my FOV
-                    </label>
+                    <!-- Cycles Disabled → Relaxed (size against the frame's
+                         long side, how an elongated galaxy is framed) →
+                         Strict (against the short side, as if round). -->
+                    <button class="tonight-filter-chip tonight-filter-toggle"
+                            :class="{ active: tonight.fovFit !== 'off', disabled: !tonightHasFovData() }"
+                            :disabled="!tonightHasFovData()"
+                            @click="tonightCycleFovFit()"
+                            :title="tonightFovTitle()"
+                            x-text="tonightFovLabel()"></button>
                     <!-- Ranks emission nebulae as shot through a line filter,
                          which cuts most of the light pollution. Starts from
                          what the host finds on the rig (wheel or attached

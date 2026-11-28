@@ -41,9 +41,10 @@ namespace NINA.Polaris.Services;
 ///     night window (10° for the Moon, it's always interesting),
 ///     and dimmer than mag 10 cuts.
 ///
-/// The "FitsCameraFov" flag is computed when a camera is connected and
-/// the active rig has a focal length, comparing the object's major /
-/// minor axes against the camera FOV in arcminutes.
+/// The "FitsCameraFov" flag is computed for deep-sky objects with a
+/// catalogue size when a sensor size (connected camera or the rig's
+/// remembered one) and a focal length are known: the size in arcminutes
+/// against the long side of the camera FOV. See <see cref="FitsFov"/>.
 /// </summary>
 public class TonightsBestService {
     private readonly SkyCatalogService    _catalog;
@@ -166,7 +167,7 @@ public class TonightsBestService {
                 PeakAltDeg:      Math.Round(peakAlt, 1),
                 PeakUtc:         peakUtc,
                 Score:           score,
-                FitsCameraFov:   null,                  // catalog has no size for now
+                FitsCameraFov:   FitsFov(sizeArcmin, fov?.WidthArcmin, fov?.HeightArcmin),
                 CameraFovWidthArcmin:  fov?.WidthArcmin,
                 CameraFovHeightArcmin: fov?.HeightArcmin,
                 Catalog:         dso.Catalog
@@ -659,6 +660,23 @@ public class TonightsBestService {
     }
 
     private record CameraFov(double WidthArcmin, double HeightArcmin);
+
+    /// <summary>Whether an object of <paramref name="sizeArcmin"/> fits the
+    /// camera's field. The catalogue gives one size per object, not a major and
+    /// minor axis, so the size is held against one side of the frame. Relaxed
+    /// (the default the API sends) uses the long side, which is how an
+    /// elongated galaxy such as M31 is framed; strict uses the short side, as
+    /// if every object were round. The web page offers both, from the same
+    /// size and FOV fields. <c>null</c> when either the size or the FOV is
+    /// unknown, which the filter treats as "can't say".</summary>
+    internal static bool? FitsFov(double sizeArcmin, double? fovWidthArcmin, double? fovHeightArcmin,
+                                  bool strict = false) {
+        if (sizeArcmin <= 0 || fovWidthArcmin is not > 0 || fovHeightArcmin is not > 0) return null;
+        var side = strict
+            ? Math.Min(fovWidthArcmin.Value, fovHeightArcmin.Value)
+            : Math.Max(fovWidthArcmin.Value, fovHeightArcmin.Value);
+        return sizeArcmin <= side;
+    }
 }
 
 // ---------- DTOs ----------

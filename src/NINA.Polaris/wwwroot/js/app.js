@@ -2820,7 +2820,14 @@ function ninaApp() {
             // Settings card this error is about, so the message can offer a
             // way there instead of naming a page and leaving you to find it.
             errorCard: '',
-            lastFetched: null, filter: 'all', fitsFovOnly: false,
+            lastFetched: null, filter: 'all',
+            // The "Fit FOV" chip, cycled off → relaxed → strict. The catalogue
+            // has one size per object, so relaxed holds it against the frame's
+            // long side (how an elongated galaxy is framed) and strict against
+            // the short side (as if every object were round). Starts off on
+            // every load, like the other filter chips, so a reload never hides
+            // targets without saying so.
+            fovFit: 'off',
             // Rank emission nebulae as shot through a narrowband filter.
             // null = whatever the host detects from the rig's filters.
             narrowband: null,
@@ -5765,7 +5772,7 @@ function ninaApp() {
                 // so the list starts again at its first page and draws the
                 // charts and thumbnails of the cards now on it.
                 this.$watch('tonight.filter', () => this._renderTonightChartsDeferred());
-                this.$watch('tonight.fitsFovOnly', () => this._renderTonightChartsDeferred());
+                this.$watch('tonight.fovFit', () => this._renderTonightChartsDeferred());
             } catch (_) { /* $watch unavailable */ }
 
             // AUTH-3: gate the rest of init on auth. _authBoot is
@@ -21996,8 +22003,8 @@ function ninaApp() {
             if (this.tonight.filter && this.tonight.filter !== 'all') {
                 xs = xs.filter(i => this._tonightMatch(i, this.tonight.filter));
             }
-            if (this.tonight.fitsFovOnly && this.tonightHasFovData()) {
-                xs = xs.filter(i => i.fitsCameraFov === true);
+            if (this.tonight.fovFit !== 'off' && this.tonightHasFovData()) {
+                xs = xs.filter(i => this.tonightFitsFov(i) === true);
             }
             return xs;
         },
@@ -22107,8 +22114,55 @@ function ninaApp() {
             this._tonightAlt = {};
         },
 
+        // The camera FOV the list was computed for, { w, h } in arcmin, or null
+        // when the host knows no sensor size or no focal length.
+        _tonightFov() {
+            const e = this.tonight.envelope;
+            const w = e && e.cameraFovWidthArcmin, h = e && e.cameraFovHeightArcmin;
+            return w > 0 && h > 0 ? { w, h } : null;
+        },
+
+        // The frame side a target must fit under the current mode: the short
+        // side when strict, the long side otherwise.
+        _tonightFovSide(fov) {
+            return this.tonight.fovFit === 'strict' ? Math.min(fov.w, fov.h) : Math.max(fov.w, fov.h);
+        },
+
+        // Whether an item fits the FOV under the current relaxed/strict rule,
+        // mirroring TonightsBestService.FitsFov. null = can't say (no size,
+        // e.g. the Moon, planets, comets and favourites, or no FOV).
+        tonightFitsFov(item) {
+            const fov = this._tonightFov();
+            const size = item && item.sizeMajorArcmin;
+            if (!fov || !(size > 0)) return null;
+            return size <= this._tonightFovSide(fov);
+        },
+
+        // The chip works once there is an FOV and at least one sized object to
+        // hold against it. It used to wait for the server's fitsCameraFov,
+        // which was never set, so the chip stayed off with a camera connected.
         tonightHasFovData() {
-            return this.tonight.items.some(i => i.fitsCameraFov !== null);
+            return !!this._tonightFov() && this.tonight.items.some(i => i.sizeMajorArcmin > 0);
+        },
+
+        tonightFovLabel() {
+            const m = this.tonight.fovFit;
+            return 'Fit FOV: ' + (m === 'strict' ? 'Strict' : m === 'relaxed' ? 'Relaxed' : 'Disabled');
+        },
+
+        tonightFovTitle() {
+            const fov = this._tonightFov();
+            if (!fov) return 'Needs a sensor size (connect the camera once) and a focal length on the active rig';
+            const frame = `camera FOV ${fov.w.toFixed(0)}′ × ${fov.h.toFixed(0)}′`;
+            const next = { off: 'relaxed', relaxed: 'strict', strict: 'disabled' }[this.tonight.fovFit];
+            if (this.tonight.fovFit === 'off') return `Show only objects that fit the ${frame}. Tap for ${next}.`;
+            const which = this.tonight.fovFit === 'strict' ? 'short' : 'long';
+            return `Objects up to ${this._tonightFovSide(fov).toFixed(0)}′ across, the ${which} side of the ${frame}. Tap for ${next}.`;
+        },
+
+        tonightCycleFovFit() {
+            if (!this.tonightHasFovData()) return;
+            this.tonight.fovFit = { off: 'relaxed', relaxed: 'strict', strict: 'off' }[this.tonight.fovFit] || 'off';
         },
 
         // Used in `:key` / `:id` bindings, has to be DOM-safe (no slashes,
